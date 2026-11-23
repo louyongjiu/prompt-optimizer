@@ -12,6 +12,7 @@ import { createSessionSnapshotWriter, readSessionSnapshot, runSessionWrite, type
 import { pauseImageStorageGc, queueImageStorageMaintenance } from './imageStorageMaintenance'
 import { persistGeneratedImage, persistImagePayloadAsAssetId } from '../../utils/image-asset-storage'
 import { beginOutputStream, getOutputDocument, restoredOutputStatus } from '../../utils/output-document'
+import { clearOutputTokenUsage, setOutputTokenUsage } from '../../utils/token-usage'
 
 const KEY = 'session/v1/arena'
 const copy = <T>(value: T): T => JSON.parse(JSON.stringify(value))
@@ -33,10 +34,10 @@ export const useArenaSession = defineStore('arena-session', () => {
     const services = getPiniaServices()
     if (model.kind === 'text') {
       const base = configurations.value.text.find(c => c.id === model.configKey)
-      return base && services?.textAdapterRegistry ? resolveRuntimeTextModel(base, { modelId: model.modelId }, services.textAdapterRegistry) : undefined
+      return base && services?.textAdapterRegistry ? resolveRuntimeTextModel(base, { modelId: model.modelId, paramOverrides: model.paramOverrides }, services.textAdapterRegistry) : undefined
     }
     const base = configurations.value.image.find(c => c.id === model.configKey)
-    return base && services?.imageAdapterRegistry ? resolveRuntimeImageModel(base, { modelId: model.modelId }, services.imageAdapterRegistry) : undefined
+    return base && services?.imageAdapterRegistry ? resolveRuntimeImageModel(base, { modelId: model.modelId, paramOverrides: model.paramOverrides }, services.imageAdapterRegistry) : undefined
   }
   let invalidSnapshot = false
   let hydrating = false
@@ -172,10 +173,10 @@ export const useArenaSession = defineStore('arena-session', () => {
         if (!base?.enabled) throw new Error('arena.unavailable')
         let config: TextModelConfig | ImageModelConfig
         if (model.kind === 'text' && services.textAdapterRegistry) {
-          config = resolveRuntimeTextModel(copy(base as TextModelConfig), { modelId: model.modelId }, services.textAdapterRegistry)
+          config = resolveRuntimeTextModel(copy(base as TextModelConfig), { modelId: model.modelId, paramOverrides: model.paramOverrides }, services.textAdapterRegistry)
           configurations.value = { ...configurations.value, text: [...configurations.value.text.filter(c => c.id !== base.id), base as TextModelConfig] }
         } else if (model.kind === 'image' && services.imageAdapterRegistry) {
-          config = resolveRuntimeImageModel(copy(base as ImageModelConfig), { modelId: model.modelId }, services.imageAdapterRegistry)
+          config = resolveRuntimeImageModel(copy(base as ImageModelConfig), { modelId: model.modelId, paramOverrides: model.paramOverrides }, services.imageAdapterRegistry)
           configurations.value = { ...configurations.value, image: [...configurations.value.image.filter(c => c.id !== base.id), base as ImageModelConfig] }
         } else throw new Error('arena.unavailable')
         live.effective = describeRuntimeModel(config)
@@ -186,6 +187,7 @@ export const useArenaSession = defineStore('arena-session', () => {
         stream.signal.addEventListener('abort', () => {
           if (current() && stream.document.phase === 'cancelled') { live.status = 'cancelled'; controller.abort() }
         }, { once: true })
+        let capturedUsage: unknown
         try {
           if (model.kind === 'image') {
             if (!services.imageService) throw new Error('arena.unavailable')
@@ -211,6 +213,7 @@ export const useArenaSession = defineStore('arena-session', () => {
               onReasoningToken: token => { if (accepts()) stream.onReasoningToken(token) },
               onComplete: response => {
                 if (!accepts() || !response) return
+                if (response.metadata?.usage !== undefined) capturedUsage = response.metadata.usage
                 if (!stream.document.length && response.content) stream.onToken(response.content)
                 if (!stream.document.size('reasoning') && response.reasoning) stream.onReasoningToken(response.reasoning)
               },
@@ -230,7 +233,14 @@ export const useArenaSession = defineStore('arena-session', () => {
           }
         } catch (error) {
           if (current()) { live.status = 'error'; live.error = stream.document.phase === 'capacity' ? 'arena.capacity' : error instanceof Error ? error.message : String(error) }
-        } finally { stream.finish(live.status === 'error') }
+        } finally {
+          stream.finish(live.status === 'error')
+          if (current() && live.status === 'success' && capturedUsage !== undefined) {
+            setOutputTokenUsage(live.output, capturedUsage)
+          } else {
+            clearOutputTokenUsage(live.output)
+          }
+        }
       })()
     } catch (error) {
       if (current()) { live.status = 'error'; live.error = error instanceof Error ? error.message : String(error) }
